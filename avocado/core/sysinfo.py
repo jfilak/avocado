@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import time
+from functools import partial
 
 try:
     import subprocess32 as subprocess
@@ -251,6 +252,83 @@ class JournalctlWatcher(Collectible):
                           dstpath)
             except Exception as e:
                 log.debug("Journalctl collection failed: %s", e)
+
+
+class ProblemsWatcher(object):
+
+    """
+    Gather information from Problems D-Bus service. A problem can be a core
+    dump file or a Python exception, or a Java exception, or a Kernel oops ...
+    """
+
+    PROBLEMS_BUS = "org.freedesktop.problems"
+    PROBLEMS_PATH = "/org/freedesktop/Problems2"
+    PROBLEMS_IFACE = "org.freedesktop.Problems2"
+    ENTRY_IFACE = "org.freedesktop.Problems2.Entry"
+
+    def __init__(self):
+        super(ProblemsWatcher, self)
+        self.after = time.time()
+
+    def _save_binary_element(self, element, dstpath):
+        elementfd = element.take()
+        try:
+            with gzip.GzipFile(dstpath, "w") as outfile:
+                for chunk in iter(partial(os.read, elementfd, 4096), ''):
+                    outfile.write(chunk)
+        finally:
+            os.close(elementfd)
+
+    def _save_element(self, element, dstpath, dbus):
+        if isinstance(element, dbus.types.UnixFd):
+            self._save_binary_element(element, dstpath)
+            return
+
+        with gzip.GzipFile(dstpath, "w") as outfile:
+            outfile.write(element)
+
+    def run(self, logdir):
+        import dbus
+
+        bus = dbus.SystemBus()
+
+        proxy = bus.get_object(self.PROBLEMS_BUS, self.PROBLEMS_PATH)
+        problems = dbus.Interface(proxy, dbus_interface=self.PROBLEMS_IFACE)
+
+        # 0x0 - problems accessible without PolicyKit authorization
+        prblms = problems.GetProblems(0x0, {})
+
+        for i, path in enumerate(prblms):
+            prblm_proxy = bus.get_object(self.PROBLEMS_BUS, path)
+            props = dbus.Interface(prblm_proxy,
+                                   "org.freedesktop.DBus.Properties")
+
+            last_occurrence = props.Get(self.ENTRY_IFACE, "LastOccurrence")
+            if last_occurrence < self.after:
+                continue
+
+            problem = dbus.Interface(prblm_proxy, self.ENTRY_IFACE)
+
+            # 0x0 - return short texts as string and binary files as FDs
+            elements = problem.ReadElements(["pid", "backtrace", "coredump",
+                                            "type"],
+                                            0x0)
+            # C/C++ (CCpp), Go
+            if "coredump" in elements:
+                basename = "core.{}.{}.gz".format(elements["type"],
+                                                  elements["pid"])
+                dstpath = os.path.join(logdir, basename)
+                self._save_binary_element(elements["coredump"], dstpath)
+
+            # Kernel oops, Python, Java, Node.js, Ruby
+            if "backtrace" in elements:
+                # Kernel oops problems do not have 'pid'
+                bid = elements.get("pid", i)
+                basename = "backtrace.{}.{}.gz".format(elements["type"],
+                                                       str(bid))
+                dstpath = os.path.join(logdir, basename)
+                # A huge backtrace can be returned as FD
+                self._save_element(elements["backtrace"], dstpath, dbus)
 
 
 class LogWatcher(Collectible):
